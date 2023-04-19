@@ -207,11 +207,10 @@ proc dbFormat(formatstr: SqlQuery, args: varargs[string]): string {.
   ## and quotes the arguments
   dbFormatImpl(formatstr, dbQuote, args)
 
-proc prepareFetch(db: var DbConn, query: SqlQuery,
-                args: varargs[string, `$`]): TSqlSmallInt {.
+proc prepareExec(db: var DbConn, query: SqlQuery,
+                args: varargs[string, `$`]) {.
                 tags: [ReadDbEffect, WriteDbEffect], raises: [DbError].} =
-  # Prepare a statement, execute it and fetch the data to the driver
-  # ready for retrieval of the data
+  # Prepare a statement, execute it
   # Used internally by iterators and retrieval procs
   # requires calling
   #      properFreeResult(SQL_HANDLE_STMT, db.stmt)
@@ -220,14 +219,11 @@ proc prepareFetch(db: var DbConn, query: SqlQuery,
   var q = dbFormat(query, args)
   db.sqlCheck(SQLPrepare(db.stmt, q.PSQLCHAR, q.len.TSqlSmallInt))
   db.sqlCheck(SQLExecute(db.stmt))
-  result = SQLFetch(db.stmt)
-  db.sqlCheck(result)
 
-proc prepareFetchDirect(db: var DbConn, query: SqlQuery,
+proc prepareExecDirect(db: var DbConn, query: SqlQuery,
                 args: varargs[string, `$`]) {.
                 tags: [ReadDbEffect, WriteDbEffect], raises: [DbError].} =
-  # Prepare a statement, execute it and fetch the data to the driver
-  # ready for retrieval of the data
+  # Prepare a statement, execute it
   # Used internally by iterators and retrieval procs
   # requires calling
   #      properFreeResult(SQL_HANDLE_STMT, db.stmt)
@@ -235,7 +231,6 @@ proc prepareFetchDirect(db: var DbConn, query: SqlQuery,
   db.sqlCheck(SQLAllocHandle(SQL_HANDLE_STMT, db.hDb, db.stmt))
   var q = dbFormat(query, args)
   db.sqlCheck(SQLExecDirect(db.stmt, q.PSQLCHAR, q.len.TSqlSmallInt))
-  db.sqlCheck(SQLFetch(db.stmt))
 
 proc tryExec*(db: var DbConn, query: SqlQuery, args: varargs[string, `$`]): bool {.
   tags: [ReadDbEffect, WriteDbEffect], raises: [].} =
@@ -243,7 +238,7 @@ proc tryExec*(db: var DbConn, query: SqlQuery, args: varargs[string, `$`]): bool
   var
     res:TSqlSmallInt = -1
   try:
-    db.prepareFetchDirect(query, args)
+    db.prepareExecDirect(query, args)
     var
       rCnt:TSqlLen = -1
     res = SQLRowCount(db.stmt, rCnt)
@@ -252,14 +247,10 @@ proc tryExec*(db: var DbConn, query: SqlQuery, args: varargs[string, `$`]): bool
   except: discard
   return res == SQL_SUCCESS
 
-proc rawExec(db: var DbConn, query: SqlQuery, args: varargs[string, `$`]) {.
-            tags: [ReadDbEffect, WriteDbEffect], raises: [DbError].} =
-  db.prepareFetchDirect(query, args)
-
 proc exec*(db: var DbConn, query: SqlQuery, args: varargs[string, `$`]) {.
             tags: [ReadDbEffect, WriteDbEffect], raises: [DbError].} =
   ## Executes the query and raises EDB if not successful.
-  db.prepareFetchDirect(query, args)
+  db.prepareExecDirect(query, args)
   properFreeResult(SQL_HANDLE_STMT, db.stmt)
 
 proc newRow(L: int): Row {.noSideEFfect.} =
@@ -283,7 +274,9 @@ iterator fastRows*(db: var DbConn, query: SqlQuery,
     sz: TSqlLen = 0
     cCnt: TSqlSmallInt = 0
     res: TSqlSmallInt = 0
-  res = db.prepareFetch(query, args)
+  db.prepareExec(query, args)
+  res = SQLFetch(db.stmt)
+  db.sqlCheck(res)
   if res == SQL_NO_DATA:
     discard
   elif res == SQL_SUCCESS:
@@ -311,7 +304,9 @@ iterator instantRows*(db: var DbConn, query: SqlQuery,
     sz: TSqlLen = 0
     cCnt: TSqlSmallInt = 0
     res: TSqlSmallInt = 0
-  res = db.prepareFetch(query, args)
+  db.prepareExec(query, args)
+  res = SQLFetch(db.stmt)
+  db.sqlCheck(res)
   if res == SQL_NO_DATA:
     discard
   elif res == SQL_SUCCESS:
@@ -351,7 +346,9 @@ proc getRow*(db: var DbConn, query: SqlQuery,
     sz: TSqlLen = 0
     cCnt: TSqlSmallInt = 0
     res: TSqlSmallInt = 0
-  res = db.prepareFetch(query, args)
+  db.prepareExec(query, args)
+  res = SQLFetch(db.stmt)
+  db.sqlCheck(res)
   if res == SQL_NO_DATA:
     result = @[]
   elif res == SQL_SUCCESS:
@@ -378,7 +375,9 @@ proc getAllRows*(db: var DbConn, query: SqlQuery,
     sz: TSqlLen = 0
     cCnt: TSqlSmallInt = 0
     res: TSqlSmallInt = 0
-  res = db.prepareFetch(query, args)
+  db.prepareExec(query, args)
+  res = SQLFetch(db.stmt)
+  db.sqlCheck(res)
   if res == SQL_NO_DATA:
     result = @[]
   elif res == SQL_SUCCESS:
@@ -457,7 +456,7 @@ proc tryInsert*(db: var DbConn, query: SqlQuery,pkName: string,
   tryInsertID(db, query, args)
 
 proc insert*(db: var DbConn, query: SqlQuery, pkName: string,
-             args: varargs[string, `$`]): int64 
+             args: varargs[string, `$`]): int64
             {.tags: [ReadDbEffect, WriteDbEffect], since: (1, 3).} =
   ## same as insertId
   result = tryInsert(db, query,pkName, args)
@@ -469,12 +468,9 @@ proc execAffectedRows*(db: var DbConn, query: SqlQuery,
   ## Runs the query (typically "UPDATE") and returns the
   ## number of affected rows
   result = -1
-  db.sqlCheck(SQLAllocHandle(SQL_HANDLE_STMT, db.hDb, db.stmt.SqlHandle))
-  var q = dbFormat(query, args)
-  db.sqlCheck(SQLPrepare(db.stmt, q.PSQLCHAR, q.len.TSqlSmallInt))
-  rawExec(db, query, args)
+  db.prepareExecDirect(query, args)
   var rCnt:TSqlLen = -1
-  db.sqlCheck(SQLRowCount(db.hDb, rCnt))
+  db.sqlCheck(SQLRowCount(db.stmt, rCnt))
   properFreeResult(SQL_HANDLE_STMT, db.stmt)
   result = rCnt.int64
 
