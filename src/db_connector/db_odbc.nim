@@ -112,6 +112,126 @@ type
                                                     ## used to get a row's
                                                     ## column text on demand
 
+  SqlValueKind* = enum ## \
+    ## Enum of all possible value types in a sqlValue database.
+    sqlValueNull,
+    sqlValueInteger,
+    sqlValueReal,
+    sqlValueText,
+    sqlValueBlob
+
+  SqlValue* = object ## \
+    ## Can represent any value in a sqlValue database.
+    case kind*: SqlValueKind
+    of sqlValueInteger:
+        intVal*: int64
+    of sqlValueReal:
+        floatVal*: float64
+    of sqlValueText:
+        strVal*: string
+    of sqlValueBlob:
+        blobVal*: seq[byte]
+    of sqlValueNull:
+        discard
+
+proc toSqlValue*[T: Ordinal](val: T): SqlValue =
+    ## Convert an ordinal value to a SqlValue.
+    SqlValue(kind: sqlValueInteger, intVal: val.int64)
+
+proc toSqlValue*[T: SomeFloat](val: T): SqlValue =
+    ## Convert a float to a SqlValue.
+    SqlValue(kind: sqlValueReal, floatVal: val)
+
+proc toSqlValue*[T: string](val: T): SqlValue =
+    ## Convert a string to a SqlValue.
+    SqlValue(kind: sqlValueText, strVal: val)
+
+proc toSqlValue*[T: seq[byte]](val: T): SqlValue =
+    ## Convert a sequence of bytes to a SqlValue.
+    SqlValue(kind: sqlValueBlob, blobVal: val)
+
+#proc toSqlValue*[T: Option](val: T): SqlValue =
+    ## Convert an optional value to a SqlValue.
+#    if val.isNone:
+#        SqlValue(kind: sqlValueNull)
+#    else:
+#        toSqlValue(val.get)
+
+proc toSqlValue*[T: type(nil)](val: T): SqlValue =
+    ## Convert a nil literal to a SqlValue.
+    SqlValue(kind: sqlValueNull)
+
+proc toSqlValues*(values: varargs[SqlValue, toSqlValue]): seq[SqlValue] =
+    ## Convert several values to a sequence of SqlValue's.
+    runnableExamples:
+        doAssert toSqlValues("string", 23) == @[toSqlValue("string"), toSqlValue(23)]
+    @values
+
+proc fromSqlValue*(value: SqlValue, T: typedesc[Ordinal]): T =
+    # Convert a SqlValue to an ordinal.
+    value.intVal.T
+
+proc fromSqlValue*(value: SqlValue, T: typedesc[SomeFloat]): float64 =
+    ## Convert a SqlValue to a float.
+    value.floatVal
+
+proc fromSqlValue*(value: SqlValue, T: typedesc[string]): string =
+    ## Convert a SqlValue to a string.
+    value.strVal
+
+proc fromSqlValue*(value: SqlValue, T: typedesc[seq[byte]]): seq[byte] =
+    ## Convert a SqlValue to a sequence of bytes.
+    value.blobVal
+
+#proc fromSqlValue*[T](value: SqlValue, _: typedesc[Option[T]]): Option[T] =
+    ## Convert a SqlValue to an optional value.
+#    if value.kind == sqlValueNull:
+#        none(T)
+#    else:
+#        some(value.fromSqlValue(T))
+
+proc fromSqlValue*(value: SqlValue, T: typedesc[SqlValue]): T =
+    ## Special overload that simply return `value`.
+    ## The purpose of this overload is to do partial unpacking.
+    ## For example, if the type of one column in a result row is unknown,
+    ## the SqlValue type can be kept just for that column.
+    ##
+    ## .. code-block:: nim
+    ##
+    ##   for row in db.iterate("SELECT name, extra FROM Person"):
+    ##       # Type of 'extra' is unknown, so we don't unpack it.
+    ##       # The 'extra' variable will be of type 'SqlValue'
+    ##       let (name, extra) = row.unpack((string, SqlValue))
+    value
+
+proc dbQuote*(s: string): string {.noSideEffect.} =
+  ## DB quotes the string.
+  result = "'"
+  for c in items(s):
+    if c == '\'': add(result, "''")
+    else: add(result, c)
+  add(result, '\'')
+
+proc `$`*(dbVal: SqlValue): string =
+    result = case dbVal.kind
+      of sqlValueInteger: $dbVal.intVal
+      of sqlValueReal:    $dbVal.floatVal
+      of sqlValueText:    dbQuote(dbVal.strVal)
+      of sqlValueBlob:    $dbVal.blobVal
+      of sqlValueNull:    "NULL"
+
+proc `==`*(a, b: SqlValue): bool =
+    ## Returns true if `a` and `b` represents the same value.
+    if a.kind != b.kind:
+        false
+    else:
+        case a.kind
+        of sqlValueInteger: a.intVal == b.intVal
+        of sqlValueReal:    a.floatVal == b.floatVal
+        of sqlValueText:    a.strVal == b.strVal
+        of sqlValueBlob:    a.blobVal == b.blobVal
+        of sqlValueNull:    true
+
 var
   buf: array[0..4096, char]
 
@@ -194,22 +314,25 @@ proc sqlGetDBMS(db: var DbConn): string {.
   except: discard
   return $(cast[cstring](addr buf))
 
-proc dbQuote*(s: string): string {.noSideEffect.} =
-  ## DB quotes the string.
-  result = "'"
-  for c in items(s):
-    if c == '\'': add(result, "''")
-    else: add(result, c)
-  add(result, '\'')
-
-proc dbFormat(formatstr: SqlQuery, args: varargs[string]): string {.
+proc dbFormat(formatstr: SqlQuery, args: varargs[SqlValue]): string {.
                   noSideEffect.} =
   ## Replace any `?` placeholders with `args`,
   ## and quotes the arguments
-  dbFormatImpl(formatstr, dbQuote, args)
+  var res = ""
+  var a = 0
+  for c in items(string(formatstr)):
+    if c == '?':
+      if a == args.len:
+        dbError("""The number of "?" given exceeds the number of parameters present in the query.""")
+      add(res, $args[a])
+      inc(a)
+    else:
+      add(res, c)
+  #debugEcho res
+  res
 
 proc prepareExec(db: var DbConn, query: SqlQuery,
-                args: varargs[string, `$`]) {.
+                args: varargs[SqlValue, toSqlValue]) {.
                 tags: [ReadDbEffect, WriteDbEffect], raises: [DbError].} =
   # Prepare a statement, execute it
   # Used internally by iterators and retrieval procs
@@ -222,7 +345,7 @@ proc prepareExec(db: var DbConn, query: SqlQuery,
   db.sqlCheck(SQLExecute(db.stmt))
 
 proc prepareExecDirect(db: var DbConn, query: SqlQuery,
-                args: varargs[string, `$`]) {.
+                args: varargs[SqlValue, toSqlValue]) {.
                 tags: [ReadDbEffect, WriteDbEffect], raises: [DbError].} =
   # Prepare a statement, execute it
   # Used internally by iterators and retrieval procs
@@ -233,7 +356,7 @@ proc prepareExecDirect(db: var DbConn, query: SqlQuery,
   var q = dbFormat(query, args)
   db.sqlCheck(SQLExecDirect(db.stmt, q.PSQLCHAR, q.len.TSqlSmallInt))
 
-proc tryExec*(db: var DbConn, query: SqlQuery, args: varargs[string, `$`]): bool {.
+proc tryExec*(db: var DbConn, query: SqlQuery, args: varargs[SqlValue, toSqlValue]): bool {.
   tags: [ReadDbEffect, WriteDbEffect], raises: [].} =
   ## Tries to execute the query and returns true if successful, false otherwise.
   var
@@ -248,7 +371,7 @@ proc tryExec*(db: var DbConn, query: SqlQuery, args: varargs[string, `$`]): bool
   except: discard
   return res == SQL_SUCCESS
 
-proc exec*(db: var DbConn, query: SqlQuery, args: varargs[string, `$`]) {.
+proc exec*(db: var DbConn, query: SqlQuery, args: varargs[SqlValue, toSqlValue]) {.
             tags: [ReadDbEffect, WriteDbEffect], raises: [DbError].} =
   ## Executes the query and raises EDB if not successful.
   db.prepareExecDirect(query, args)
@@ -259,7 +382,7 @@ proc newRow(L: int): Row {.noSideEFfect.} =
   for i in 0..L-1: result[i] = ""
 
 iterator fastRows*(db: var DbConn, query: SqlQuery,
-                   args: varargs[string, `$`]): Row {.
+                   args: varargs[SqlValue, toSqlValue]): Row {.
                 tags: [ReadDbEffect, WriteDbEffect], raises: [DbError].} =
   ## Executes the query and iterates over the result dataset.
   ##
@@ -296,7 +419,7 @@ iterator fastRows*(db: var DbConn, query: SqlQuery,
   db.sqlCheck(res)
 
 iterator instantRows*(db: var DbConn, query: SqlQuery,
-                      args: varargs[string, `$`]): InstantRow
+                      args: varargs[SqlValue, toSqlValue]): InstantRow
                 {.tags: [ReadDbEffect, WriteDbEffect].} =
   ## Same as fastRows but returns a handle that can be used to get column text
   ## on demand using `[]`. Returned handle is valid only within the iterator body.
@@ -338,7 +461,7 @@ proc len*(row: InstantRow): int {.inline.} =
   row.len
 
 proc getRow*(db: var DbConn, query: SqlQuery,
-             args: varargs[string, `$`]): Row {.
+             args: varargs[SqlValue, toSqlValue]): Row {.
           tags: [ReadDbEffect, WriteDbEffect], raises: [DbError].} =
   ## Retrieves a single row. If the query doesn't return any rows, this proc
   ## will return a Row with empty strings for each column.
@@ -367,7 +490,7 @@ proc getRow*(db: var DbConn, query: SqlQuery,
   db.sqlCheck(res)
 
 proc getAllRows*(db: var DbConn, query: SqlQuery,
-                 args: varargs[string, `$`]): seq[Row] {.
+                 args: varargs[SqlValue, toSqlValue]): seq[Row] {.
            tags: [ReadDbEffect, WriteDbEffect], raises: [DbError] .} =
   ## Executes the query and returns the whole result dataset.
   var
@@ -398,7 +521,7 @@ proc getAllRows*(db: var DbConn, query: SqlQuery,
   db.sqlCheck(res)
 
 iterator rows*(db: var DbConn, query: SqlQuery,
-               args: varargs[string, `$`]): Row {.
+               args: varargs[SqlValue, toSqlValue]): Row {.
          tags: [ReadDbEffect, WriteDbEffect], raises: [DbError].} =
   ## Same as `fastRows`, but slower and safe.
   ##
@@ -408,7 +531,7 @@ iterator rows*(db: var DbConn, query: SqlQuery,
   for r in items(getAllRows(db, query, args)): yield r
 
 proc getValue*(db: var DbConn, query: SqlQuery,
-               args: varargs[string, `$`]): string {.
+               args: varargs[SqlValue, toSqlValue]): string {.
            tags: [ReadDbEffect, WriteDbEffect], raises: [].} =
   ## Executes the query and returns the first column of the first row of the
   ## result dataset. Returns "" if the dataset contains no rows or the database
@@ -419,7 +542,7 @@ proc getValue*(db: var DbConn, query: SqlQuery,
   except: discard
 
 proc tryInsertId*(db: var DbConn, query: SqlQuery,
-                  args: varargs[string, `$`]): int64 {.
+                  args: varargs[SqlValue, toSqlValue]): int64 {.
             tags: [ReadDbEffect, WriteDbEffect], raises: [].} =
   ## Executes the query (typically "INSERT") and returns the
   ## generated ID for the row or -1 in case of an error.
@@ -433,7 +556,7 @@ proc tryInsertId*(db: var DbConn, query: SqlQuery,
         result = getValue(db, sql"SELECT LASTVAL();", []).parseInt
       of "mysql":
         result = getValue(db, sql"SELECT LAST_INSERT_ID();", []).parseInt
-      of "sqlite":
+      of "sqlValue":
         result = getValue(db, sql"SELECT LAST_INSERT_ROWID();", []).parseInt
       of "microsoft sql server":
         result = getValue(db, sql"SELECT SCOPE_IDENTITY();", []).parseInt
@@ -443,7 +566,7 @@ proc tryInsertId*(db: var DbConn, query: SqlQuery,
     except: discard
 
 proc insertId*(db: var DbConn, query: SqlQuery,
-               args: varargs[string, `$`]): int64 {.
+               args: varargs[SqlValue, toSqlValue]): int64 {.
          tags: [ReadDbEffect, WriteDbEffect], raises: [DbError].} =
   ## Executes the query (typically "INSERT") and returns the
   ## generated ID for the row.
@@ -451,20 +574,20 @@ proc insertId*(db: var DbConn, query: SqlQuery,
   if result < 0: dbError(db)
 
 proc tryInsert*(db: var DbConn, query: SqlQuery,pkName: string,
-                args: varargs[string, `$`]): int64
+                args: varargs[SqlValue, toSqlValue]): int64
                {.tags: [ReadDbEffect, WriteDbEffect], raises: [], since: (1, 3).} =
   ## same as tryInsertID
   tryInsertID(db, query, args)
 
 proc insert*(db: var DbConn, query: SqlQuery, pkName: string,
-             args: varargs[string, `$`]): int64
+             args: varargs[SqlValue, toSqlValue]): int64
             {.tags: [ReadDbEffect, WriteDbEffect], since: (1, 3).} =
   ## same as insertId
   result = tryInsert(db, query,pkName, args)
   if result < 0: dbError(db)
 
 proc execAffectedRows*(db: var DbConn, query: SqlQuery,
-                       args: varargs[string, `$`]): int64 {.
+                       args: varargs[SqlValue, toSqlValue]): int64 {.
              tags: [ReadDbEffect, WriteDbEffect], raises: [DbError].} =
   ## Runs the query (typically "UPDATE") and returns the
   ## number of affected rows
