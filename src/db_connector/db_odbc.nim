@@ -1,3 +1,4 @@
+import ba0f3/hexdump
 #
 #
 #            Nim's Runtime Library
@@ -95,7 +96,7 @@
 ##   theDb.close()
 ##   ```
 
-import strutils, ./odbcsql
+import strutils, ./odbcsql, macros
 import ./db_common
 export db_common
 
@@ -527,3 +528,110 @@ proc setEncoding*(connection: DbConn, encoding: string): bool {.
   ## success, false for failure.
   ##result = set_character_set(connection, encoding) == 0
   dbError("setEncoding() is currently not implemented by the db_odbc module")
+
+
+proc prepareStmt*(db: var DbConn) =
+  db.sqlCheck(SQLAllocHandle(SQL_HANDLE_STMT, db.hDb, db.stmt))
+
+proc bindParam*(db: var DbConn, num: int, value: any, valueLen: int = 0) =
+  var
+    fCType: TSqlSmallInt
+    fSqlType: TSqlSmallInt
+    cbColDef: TSQLULEN = 0
+    cbValueMax: TSQLLEN = 0
+    pcbValue = SQL_NTS
+
+
+  var v: pointer
+  when value is int:
+    fCType = SQL_C_LONG
+    fSqlType = SQL_INTEGER
+
+  elif value is string or value is cstring:
+    echo "string"
+    fCType = SQL_C_CHAR
+    fSqlType = SQL_WVARCHAR
+    cbColDef = value.len.uint
+    cbValueMax = value.len
+  elif value is char:
+    echo "char"
+    fCType = SQL_C_CHAR
+    fSqlType = SQL_CHAR
+    cbColDef = 1
+    cbValueMax = 1
+  else:
+    fCType = SQL_C_DEFAULT
+    fSqlType = SQL_DEFAULT
+
+  when value is string or value is cstring:
+    v = alloc0(value.len + 1)
+    copyMem(v, unsafeAddr value[0], value.len)
+    #v = realloc(v, (value.len + 1)*2)
+  else:
+    v = alloc(sizeof(value))
+    copyMem(v, unsafeAddr value, sizeof(value))
+
+  db.sqlcheck(SQLBindParameter(db.stmt, num.int16, SQL_PARAM_INPUT, fCType, fSqlType, cbColDef, 0, v, cbValueMax, pcbValue))
+
+
+proc getRow*(db: var DbConn, query: string): Row {.
+          tags: [ReadDbEffect, WriteDbEffect], raises: [DbError].} =
+  ## Retrieves a single row. If the query doesn't return any rows, this proc
+  ## will return a Row with empty strings for each column.
+  var
+    sz: TSqlLen = 0
+    cCnt: TSqlSmallInt = 0
+    res: TSqlSmallInt = 0
+  db.sqlCheck(SQLExecDirect(db.stmt, query.PSQLCHAR, SQL_NTS))
+  res = SQLFetch(db.stmt)
+  db.sqlCheck(res)
+  if res == SQL_NO_DATA:
+    result = @[]
+  elif res == SQL_SUCCESS:
+    res = SQLNumResultCols(db.stmt, cCnt)
+    result = newRow(cCnt)
+    result.setLen(max(cCnt,0))
+    for colId in 1..cCnt:
+      buf[0] = '\0'
+      db.sqlCheck(SQLGetData(db.stmt, colId.SqlUSmallInt, SQL_C_CHAR,
+                               cast[cstring](buf.addr), 4095, sz.addr))
+      result[colId-1] = $cast[cstring](addr buf)
+    res = SQLFetch(db.stmt)
+
+  properFreeResult(SQL_HANDLE_STMT, db.stmt)
+  db.sqlCheck(res)
+
+proc getAllRows*(db: var DbConn, query: string): seq[Row] =
+  var
+    rowRes: Row
+    sz: TSqlLen = 0
+    cCnt: TSqlSmallInt = 0
+    res: TSqlSmallInt = 0
+  db.sqlCheck(SQLExecDirect(db.stmt, query.PSQLCHAR, SQL_NTS))
+  res = SQLFetch(db.stmt)
+  db.sqlCheck(res)
+  if res == SQL_NO_DATA:
+    result = @[]
+  elif res == SQL_SUCCESS:
+    res = SQLNumResultCols(db.stmt, cCnt)
+    rowRes = newRow(cCnt)
+    rowRes.setLen(max(cCnt,0))
+    while res == SQL_SUCCESS:
+      for colId in 1..cCnt:
+        buf[0] = '\0'
+        db.sqlCheck(SQLGetData(db.stmt, colId.SqlUSmallInt, SQL_C_CHAR,
+                                 cast[cstring](buf.addr), 4095, sz.addr))
+        rowRes[colId-1] = $cast[cstring](addr buf)
+      result.add(rowRes)
+      res = SQLFetch(db.stmt)
+  properFreeResult(SQL_HANDLE_STMT, db.stmt)
+  db.sqlCheck(res)
+
+proc getValue*(db: var DbConn, query: string): string {.tags: [ReadDbEffect, WriteDbEffect], raises: [].} =
+  ## Executes the query and returns the first column of the first row of the
+  ## result dataset. Returns "" if the dataset contains no rows or the database
+  ## value is NULL.
+  result = ""
+  try:
+    result = getRow(db, query)[0]
+  except: discard
